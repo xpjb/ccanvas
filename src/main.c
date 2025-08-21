@@ -13,6 +13,7 @@
 #define MAX_CACHED_CHUNKS 512 
 #define TEXT_INPUT_MAX 255
 #define BASE_FONT_SIZE 256
+#define COLOR_PICKER_GAMMA 2.0f // Use a power curve for more intuitive brightness selection
 
 //--- Structs ---
 typedef struct CanvasChunk {
@@ -70,7 +71,7 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
 void DrawWorld(Canvas canvas, Camera2D camera, ToolType currentTool, float brushSize, float textSize, TextInput textInput, UIState ui, Color currentColor);
 void DrawUI(ToolType currentTool, Color currentColor, UIState *ui);
 Vector2 GetLocalChunkPos(Vector2 worldPos, Vector2 gridPos);
-Image GenImageColorPicker(int width, int height, float value);
+Image GenImageColorPicker(int width, int height, float hue);
 
 //--- Main Entry Point ---
 int main(void) {
@@ -79,7 +80,7 @@ int main(void) {
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(screenWidth, screenHeight, "ccanvas - with caching");
-    SetExitKey(KEY_NULL); // Disable escape key for closing window
+    SetExitKey(KEY_NULL);
     SetTargetFPS(60);
 
     Canvas canvas = Canvas_Create();
@@ -93,23 +94,22 @@ int main(void) {
     ToolType currentTool = TOOL_BRUSH;
     float brushSize = 20.0f;
     float textSize = 40.0f;
-    Color currentColor = RED;
+    Color currentColor = BLACK;
 
     TextInput textInput = { 0 };
 
     UIState ui = {
         .font = LoadFontEx("LiberationSans-Regular.ttf", BASE_FONT_SIZE, 0, 0),
-        .selectedHSV = { 0.0f, 1.0f, 1.0f } // Start with red
+        .selectedHSV = { 0.0f, 0.0f, 0.0f } // Start with black
     };
     
-    // Generate picker with full brightness so it's visible
-    Image colorPickerImage = GenImageColorPicker(256, 256, ui.selectedHSV.z);
+    Image colorPickerImage = GenImageColorPicker(400, 400, ui.selectedHSV.x);
     ui.colorPickerTexture = LoadTextureFromImage(colorPickerImage);
     UnloadImage(colorPickerImage);
 
     while (!WindowShouldClose()) {
         camera.offset = (Vector2){ GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f };
-        ui.colorPickerRect = (Rectangle){ 10, (float)GetScreenHeight() - 266, 256, 256 };
+        ui.colorPickerRect = (Rectangle){ 10, (float)GetScreenHeight() - 410, 400, 400 };
 
         Canvas_Update(&canvas, camera, GetScreenWidth(), GetScreenHeight());
 
@@ -133,13 +133,14 @@ int main(void) {
 
 //--- Helper Implementations ---
 
-Image GenImageColorPicker(int width, int height, float value) {
+Image GenImageColorPicker(int width, int height, float hue) {
     Color *pixels = (Color *)malloc(width*height*sizeof(Color));
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
-            float hue = ((float)x / (width - 1)) * 360.0f;
-            float saturation = 1.0f - ((float)y / (height - 1));
-            pixels[y*width + x] = ColorFromHSV(hue, saturation, value);
+            float saturation = (float)x / (width - 1);
+            float linearValue = 1.0f - ((float)y / (height - 1));
+            float displayValue = powf(linearValue, COLOR_PICKER_GAMMA);
+            pixels[y*width + x] = ColorFromHSV(hue, saturation, displayValue);
         }
     }
     Image image = { .data = pixels, .width = width, .height = height, .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8, .mipmaps = 1 };
@@ -156,12 +157,9 @@ void HandleCameraControls(Camera2D *camera) {
     float wheel = GetMouseWheelMove();
     if (wheel != 0 && IsKeyDown(KEY_LEFT_CONTROL)) {
         Vector2 mouseWorldPosBeforeZoom = GetScreenToWorld2D(GetMousePosition(), *camera);
-        
         camera->zoom *= (1.0f + wheel * 0.1f);
         if (camera->zoom < 0.01f) camera->zoom = 0.01f;
-
         Vector2 mouseWorldPosAfterZoom = GetScreenToWorld2D(GetMousePosition(), *camera);
-
         camera->target = Vector2Add(camera->target, Vector2Subtract(mouseWorldPosBeforeZoom, mouseWorldPosAfterZoom));
     }
 }
@@ -185,32 +183,56 @@ void StampText(Canvas *canvas, Font font, TextInput *input, Color color, float t
 }
 
 void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool, float *brushSize, float *textSize, Color *currentColor, TextInput *textInput, UIState *ui) {
-    static Vector2 lastMousePos = { 0 };
+    static bool isInteractingWithUI = false;
     Vector2 mousePos = GetMousePosition();
     Vector2 mouseWorldPos = GetScreenToWorld2D(mousePos, camera);
 
-    bool clickedOnUI = CheckCollisionPointRec(mousePos, ui->colorPickerRect);
+    bool mouseOverUI = CheckCollisionPointRec(mousePos, ui->colorPickerRect);
+
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && mouseOverUI) isInteractingWithUI = true;
+    if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) isInteractingWithUI = false;
 
     if (!textInput->active) {
         if (IsKeyPressed(KEY_B)) *currentTool = TOOL_BRUSH;
         if (IsKeyPressed(KEY_T)) *currentTool = TOOL_TEXT;
     }
 
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && clickedOnUI) {
+    if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) && !mouseOverUI) {
+        Vector2 gridPos = WorldToGrid(mouseWorldPos);
+        for (int i = 0; i < canvas->totalChunks; i++) {
+            if (canvas->chunks[i].active && Vector2Equals(canvas->chunks[i].gridPos, gridPos)) {
+                Vector2 localPos = GetLocalChunkPos(mouseWorldPos, gridPos);
+                Image chunkImage = LoadImageFromTexture(canvas->chunks[i].texture.texture);
+                ImageFlipVertical(&chunkImage);
+                Color sampledColor = GetImageColor(chunkImage, (int)localPos.x, (int)localPos.y);
+                UnloadImage(chunkImage);
+
+                *currentColor = sampledColor;
+                ui->selectedHSV = ColorToHSV(sampledColor);
+
+                Image newPickerImage = GenImageColorPicker(ui->colorPickerTexture.width, ui->colorPickerTexture.height, ui->selectedHSV.x);
+                UpdateTexture(ui->colorPickerTexture, newPickerImage.data);
+                UnloadImage(newPickerImage);
+                break;
+            }
+        }
+    }
+
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && mouseOverUI) {
         Vector2 localMouse = Vector2Subtract(mousePos, (Vector2){ui->colorPickerRect.x, ui->colorPickerRect.y});
-        localMouse.x = Clamp(localMouse.x, 0, ui->colorPickerRect.width - 1);
-        localMouse.y = Clamp(localMouse.y, 0, ui->colorPickerRect.height - 1);
-        
-        ui->selectedHSV.x = (localMouse.x / (ui->colorPickerRect.width - 1)) * 360.0f;
-        ui->selectedHSV.y = 1.0f - (localMouse.y / (ui->colorPickerRect.height - 1));
+        ui->selectedHSV.y = Clamp(localMouse.x / (ui->colorPickerRect.width - 1), 0.0f, 1.0f); // Saturation
+        float linearValue = 1.0f - Clamp(localMouse.y / (ui->colorPickerRect.height - 1), 0.0f, 1.0f);
+        ui->selectedHSV.z = powf(linearValue, COLOR_PICKER_GAMMA); // Value
     }
     *currentColor = ColorFromHSV(ui->selectedHSV.x, ui->selectedHSV.y, ui->selectedHSV.z);
 
     float wheel = GetMouseWheelMove();
     if (wheel != 0 && !IsKeyDown(KEY_LEFT_CONTROL)) {
-        if (clickedOnUI) {
-            ui->selectedHSV.z = Clamp(ui->selectedHSV.z + wheel * 0.05f, 0.0f, 1.0f);
-            Image newImage = GenImageColorPicker(ui->colorPickerTexture.width, ui->colorPickerTexture.height, ui->selectedHSV.z);
+        if (mouseOverUI) {
+            ui->selectedHSV.x -= wheel * 10.0f; // Scroll Hue
+            if (ui->selectedHSV.x < 0) ui->selectedHSV.x += 360;
+            if (ui->selectedHSV.x >= 360) ui->selectedHSV.x -= 360;
+            Image newImage = GenImageColorPicker(ui->colorPickerTexture.width, ui->colorPickerTexture.height, ui->selectedHSV.x);
             UpdateTexture(ui->colorPickerTexture, newImage.data);
             UnloadImage(newImage);
         } else {
@@ -226,10 +248,10 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
         }
     }
 
-    if (*currentTool == TOOL_BRUSH) {
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !clickedOnUI) lastMousePos = mouseWorldPos;
-
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && !clickedOnUI) {
+    if (*currentTool == TOOL_BRUSH && !isInteractingWithUI) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            static Vector2 lastMousePos = { 0 };
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) lastMousePos = mouseWorldPos;
             float dist = Vector2Distance(lastMousePos, mouseWorldPos);
             int steps = 1 + (int)(dist / (*brushSize / 4.0f));
             for (int i = 0; i <= steps; i++) {
@@ -237,7 +259,6 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
                 float radius = *brushSize / 2.0f;
                 Vector2 minGrid = WorldToGrid((Vector2){ drawPos.x - radius, drawPos.y - radius });
                 Vector2 maxGrid = WorldToGrid((Vector2){ drawPos.x + radius, drawPos.y + radius });
-
                 for (int y = (int)minGrid.y; y <= (int)maxGrid.y; y++) {
                     for (int x = (int)minGrid.x; x <= (int)maxGrid.x; x++) {
                         if (Canvas_BeginTextureMode(canvas, (Vector2){x * CHUNK_SIZE, y * CHUNK_SIZE})) {
@@ -253,9 +274,8 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
     } else if (*currentTool == TOOL_TEXT) {
         if (textInput->active) {
             bool stampAndSwitch = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE) ||
-                                  (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !clickedOnUI) ||
+                                  (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !mouseOverUI && !isInteractingWithUI) ||
                                   IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
-
             if (stampAndSwitch) {
                 if (IsKeyPressed(KEY_ENTER) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                     StampText(canvas, ui->font, textInput, *currentColor, *textSize);
@@ -277,7 +297,7 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
                 }
             }
         } else {
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !clickedOnUI) {
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !isInteractingWithUI) {
                 textInput->active = true;
                 textInput->letterCount = 0;
                 textInput->text[0] = '\0';
@@ -307,21 +327,20 @@ void DrawWorld(Canvas canvas, Camera2D camera, ToolType currentTool, float brush
 }
 
 void DrawUI(ToolType currentTool, Color currentColor, UIState *ui) {
+    // Draw Saturation/Value Picker
     DrawTexture(ui->colorPickerTexture, ui->colorPickerRect.x, ui->colorPickerRect.y, WHITE);
     DrawRectangleLinesEx(ui->colorPickerRect, 1.0f, LIGHTGRAY);
-
-    // Draw crosshair
-    float crosshairX = ui->colorPickerRect.x + (ui->selectedHSV.x / 360.0f) * (ui->colorPickerRect.width -1);
-    float crosshairY = ui->colorPickerRect.y + (1.0f - ui->selectedHSV.y) * (ui->colorPickerRect.height - 1);
+    float linearValue = powf(ui->selectedHSV.z, 1.0f / COLOR_PICKER_GAMMA);
+    float crosshairX = ui->colorPickerRect.x + ui->selectedHSV.y * (ui->colorPickerRect.width -1);
+    float crosshairY = ui->colorPickerRect.y + (1.0f - linearValue) * (ui->colorPickerRect.height - 1);
     DrawLine(crosshairX, crosshairY - 8, crosshairX, crosshairY + 8, WHITE);
     DrawLine(crosshairX - 8, crosshairY, crosshairX + 8, crosshairY, WHITE);
     DrawLine(crosshairX, crosshairY - 7, crosshairX, crosshairY + 7, BLACK);
     DrawLine(crosshairX - 7, crosshairY, crosshairX + 7, crosshairY, BLACK);
 
-    DrawFPS(10, 10);
     const char *toolName = (currentTool == TOOL_BRUSH) ? "BRUSH (B)" : "TEXT (T)";
-    DrawTextEx(ui->font, TextFormat("Tool: %s", toolName), (Vector2){10, 40}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
-    DrawTextEx(ui->font, "pan: RMB | zoom: Ctrl+scroll | size/bright: scroll", (Vector2){10, (float)GetScreenHeight() - 30}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
+    DrawTextEx(ui->font, TextFormat("Tool: %s", toolName), (Vector2){10, 10}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
+    DrawTextEx(ui->font, "pan: RMB | zoom: Ctrl+scroll | size/hue: scroll", (Vector2){10, 40}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
 }
 
 Vector2 GetLocalChunkPos(Vector2 worldPos, Vector2 gridPos) {
@@ -438,7 +457,7 @@ bool Canvas_BeginTextureMode(Canvas *canvas, Vector2 worldPos) {
         chunk->modified = true;
         return true;
     }
-    fprintf(stderr, "WARNING: Could not activate chunk for drawing at (%.2f, %.2f)\n", worldPos.x, worldPos.y);
+    fprintf(stderr, "WARNING: Could not activate chunk for drawing at (%.2f, %.2f).\n", worldPos.x, worldPos.y);
     return false;
 }
 
