@@ -87,8 +87,8 @@ Vector2 GetLocalChunkPos(Vector2 worldPos, Vector2 gridPos);
 // Main Entry Point
 //====================================================================================
 int main(void) {
-    const int screenWidth = 1280;
-    const int screenHeight = 720;
+    const int screenWidth = 1920;
+    const int screenHeight = 1080;
 
     InitWindow(screenWidth, screenHeight, "ccanvas - with caching");
     SetTargetFPS(60);
@@ -345,17 +345,17 @@ CanvasChunk* GetAndActivateChunk(Canvas *canvas, Vector2 gridPos) {
                     Texture2D tex = LoadTextureFromImage(canvas->cache[j].image);
                     newChunk->texture = LoadRenderTexture(tex.width, tex.height);
                     
-                    // Copy the loaded texture into the render texture
                     BeginTextureMode(newChunk->texture);
                         DrawTexture(tex, 0, 0, WHITE);
                     EndTextureMode();
 
-                    // Now that it's copied, we can unload the intermediate texture
                     UnloadTexture(tex); 
-
-                    // Free the cached image and mark the cache slot as inactive
                     UnloadImage(canvas->cache[j].image);
                     canvas->cache[j].active = false;
+                    
+                    // FIX: A chunk loaded from cache contains user data, so it's already "modified".
+                    newChunk->modified = true; 
+                    
                     return newChunk;
                 }
             }
