@@ -12,6 +12,7 @@
 #define CHUNK_POOL_RADIUS 4 
 #define MAX_CACHED_CHUNKS 512 
 #define TEXT_INPUT_MAX 255
+#define BASE_FONT_SIZE 256 // Load font at high resolution for crisp scaling
 
 //--- Structs ---
 typedef struct CanvasChunk {
@@ -74,6 +75,8 @@ int main(void) {
     const int screenWidth = 1920;
     const int screenHeight = 1080;
 
+    // Add resizable flag
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE);
     InitWindow(screenWidth, screenHeight, "ccanvas - with caching");
     SetTargetFPS(60);
 
@@ -81,7 +84,7 @@ int main(void) {
 
     Camera2D camera = { 0 };
     camera.target = (Vector2){ 0.0f, 0.0f };
-    camera.offset = (Vector2){ screenWidth / 2.0f, screenHeight / 2.0f };
+    camera.offset = (Vector2){ GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f };
     camera.rotation = 0.0f;
     camera.zoom = 0.5f;
 
@@ -94,14 +97,18 @@ int main(void) {
 
     UIState ui = {
         .palette = { BLACK, RED, ORANGE, YELLOW, GREEN, BLUE, VIOLET, WHITE },
-        .font = LoadFont("LiberationSans-Regular.ttf")
+        // Load font at a high resolution for better scaling
+        .font = LoadFontEx("LiberationSans-Regular.ttf", BASE_FONT_SIZE, 0, 0)
     };
     for (int i = 0; i < 8; i++) {
         ui.paletteRecs[i] = (Rectangle){ 10 + 35.0f * i, (float)GetScreenHeight() - 80, 30, 30 };
     }
 
     while (!WindowShouldClose()) {
-        Canvas_Update(&canvas, camera, screenWidth, screenHeight);
+        // Update camera offset if window is resized
+        camera.offset = (Vector2){ GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f };
+
+        Canvas_Update(&canvas, camera, GetScreenWidth(), GetScreenHeight());
 
         HandleCameraControls(&camera);
         HandleToolAndDrawing(&canvas, camera, &currentTool, &brushSize, &textSize, &currentColor, &textInput, ui);
@@ -142,24 +149,21 @@ void HandleCameraControls(Camera2D *camera) {
 
 void StampText(Canvas *canvas, Font font, TextInput *input, Color color, float textSize) {
     Vector2 textWorldPos = input->position;
-    Vector2 measuredSize = MeasureTextEx(font, input->text, textSize, 1.0f);
+    // When drawing with a high-res font, the spacing needs to be adjusted
+    Vector2 measuredSize = MeasureTextEx(font, input->text, textSize, (float)textSize/BASE_FONT_SIZE);
 
-    // Define the bounding box of the text
     Vector2 topLeft = textWorldPos;
     Vector2 bottomRight = Vector2Add(textWorldPos, measuredSize);
 
-    // Find the grid range this bounding box covers
     Vector2 minGrid = WorldToGrid(topLeft);
     Vector2 maxGrid = WorldToGrid(bottomRight);
 
-    // Iterate over all chunks the text might touch and draw on each one
     for (int y = (int)minGrid.y; y <= (int)maxGrid.y; y++) {
         for (int x = (int)minGrid.x; x <= (int)maxGrid.x; x++) {
             Vector2 currentGridPos = { (float)x, (float)y };
-            // Use a representative world pos for the chunk to activate it
             if (Canvas_BeginTextureMode(canvas, (Vector2){x * CHUNK_SIZE, y * CHUNK_SIZE})) {
                 Vector2 localPos = GetLocalChunkPos(textWorldPos, currentGridPos);
-                DrawTextEx(font, input->text, localPos, textSize, 1.0f, color);
+                DrawTextEx(font, input->text, localPos, textSize, (float)textSize/BASE_FONT_SIZE, color);
                 Canvas_EndTextureMode();
             }
         }
@@ -180,8 +184,11 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
         }
     }
 
-    if (IsKeyPressed(KEY_B)) { *currentTool = TOOL_BRUSH; textInput->active = false; }
-    if (IsKeyPressed(KEY_T)) { *currentTool = TOOL_TEXT; }
+    // Only allow tool switching when not actively typing
+    if (!textInput->active) {
+        if (IsKeyPressed(KEY_B)) *currentTool = TOOL_BRUSH;
+        if (IsKeyPressed(KEY_T)) *currentTool = TOOL_TEXT;
+    }
 
     if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && clickedOnUI) {
         for (int i = 0; i < 8; i++) {
@@ -198,9 +205,10 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
             if (*brushSize < 2) *brushSize = 2;
             if (*brushSize > 200) *brushSize = 200;
         } else if (*currentTool == TOOL_TEXT) {
-            *textSize += wheel * 5;
+            // Increase speed of text size change
+            *textSize += wheel * 10;
             if (*textSize < 8) *textSize = 8;
-            if (*textSize > 250) *textSize = 250;
+            if (*textSize > 500) *textSize = 500; // Increased max size
         }
     }
 
@@ -216,22 +224,17 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
             for (int i = 0; i <= steps; i++) {
                 Vector2 drawPos = Vector2Lerp(lastMousePos, mouseWorldPos, (float)i/steps);
                 
-                // Calculate the bounding box of the brush circle
                 float radius = *brushSize / 2.0f;
                 Vector2 topLeft = { drawPos.x - radius, drawPos.y - radius };
                 Vector2 bottomRight = { drawPos.x + radius, drawPos.y + radius };
 
-                // Find the grid range this bounding box covers
                 Vector2 minGrid = WorldToGrid(topLeft);
                 Vector2 maxGrid = WorldToGrid(bottomRight);
 
-                // Iterate over all chunks the circle might touch
                 for (int y = (int)minGrid.y; y <= (int)maxGrid.y; y++) {
                     for (int x = (int)minGrid.x; x <= (int)maxGrid.x; x++) {
-                        Vector2 currentGridPos = { (float)x, (float)y };
-                        // Use a representative world pos for the chunk to activate it
                         if (Canvas_BeginTextureMode(canvas, (Vector2){x * CHUNK_SIZE, y * CHUNK_SIZE})) {
-                            Vector2 localPos = GetLocalChunkPos(drawPos, currentGridPos);
+                            Vector2 localPos = GetLocalChunkPos(drawPos, (Vector2){(float)x, (float)y});
                             DrawCircleV(localPos, radius, *currentColor);
                             Canvas_EndTextureMode();
                         }
@@ -242,7 +245,6 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
         }
     } else if (*currentTool == TOOL_TEXT) {
         if (textInput->active) {
-            // Stamp text and switch to brush tool on various actions
             bool stampAndSwitch = IsKeyPressed(KEY_ENTER) || 
                                   (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !clickedOnUI) ||
                                   IsMouseButtonDown(MOUSE_BUTTON_RIGHT);
@@ -267,7 +269,6 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
                 }
             }
         } else {
-            // Start new text input
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !clickedOnUI) {
                 textInput->active = true;
                 textInput->letterCount = 0;
@@ -284,16 +285,20 @@ void DrawWorld(Canvas canvas, Camera2D camera, ToolType currentTool, float brush
 
         if (currentTool == TOOL_BRUSH) {
             Vector2 mouseWorldPos = GetScreenToWorld2D(GetMousePosition(), camera);
-            DrawCircleLines(mouseWorldPos.x, mouseWorldPos.y, brushSize / 2.0f, GRAY);
+            // Use DrawRingLines for a thicker, more visible cursor
+            float radius = brushSize / 2.0f;
+            DrawRingLines(mouseWorldPos, radius - 2.0f, radius, 0, 360, 32, GRAY);
         }
 
         if (textInput.active) {
-            // FIX: Use the current selected color for text preview
-            DrawTextEx(ui.font, textInput.text, textInput.position, textSize, 1.0f, currentColor);
+            // Adjust spacing based on ratio of current size to base font size for correct rendering
+            float spacing = textSize / BASE_FONT_SIZE;
+            DrawTextEx(ui.font, textInput.text, textInput.position, textSize, spacing, currentColor);
+            
             if (((int)(GetTime() * 2.0f)) % 2 == 0) {
-                Vector2 measuredSize = MeasureTextEx(ui.font, textInput.text, textSize, 1.0f);
-                // FIX: Use current color for caret as well
-                DrawRectangle(textInput.position.x + measuredSize.x, textInput.position.y, 5, textSize, currentColor);
+                Vector2 measuredSize = MeasureTextEx(ui.font, textInput.text, textSize, spacing);
+                // Make caret thicker
+                DrawRectangle(textInput.position.x + measuredSize.x, textInput.position.y, 8, textSize, currentColor);
             }
         }
     EndMode2D();
@@ -308,8 +313,8 @@ void DrawUI(ToolType currentTool, Color currentColor, UIState ui) {
 
     DrawFPS(10, 10);
     const char *toolName = (currentTool == TOOL_BRUSH) ? "BRUSH (B)" : "TEXT (T)";
-    DrawTextEx(ui.font, TextFormat("Tool: %s", toolName), (Vector2){10, 40}, 20.0f, 1.0f, LIGHTGRAY);
-    DrawTextEx(ui.font, "pan: RMB | zoom: Ctrl+scroll | size: scroll", (Vector2){10, (float)GetScreenHeight() - 30}, 20.0f, 1.0f, LIGHTGRAY);
+    DrawTextEx(ui.font, TextFormat("Tool: %s", toolName), (Vector2){10, 40}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
+    DrawTextEx(ui.font, "pan: RMB | zoom: Ctrl+scroll | size: scroll", (Vector2){10, (float)GetScreenHeight() - 30}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
 }
 
 Vector2 GetLocalChunkPos(Vector2 worldPos, Vector2 gridPos) {
