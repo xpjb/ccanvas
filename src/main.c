@@ -9,11 +9,11 @@
 //--- Defines ---
 #define CHUNK_SIZE 1024
 #define CHUNK_LOAD_PADDING 1
-#define CHUNK_POOL_RADIUS 5 
-#define MAX_CACHED_CHUNKS 512 
+#define CHUNK_POOL_RADIUS 5
+#define MAX_CACHED_CHUNKS 512
 #define TEXT_INPUT_MAX 255
 #define BASE_FONT_SIZE 256
-#define COLOR_PICKER_GAMMA 2.0f // Use a power curve for more intuitive brightness selection
+#define COLOR_PICKER_GAMMA 1.5f // Use a less aggressive power curve
 
 //--- Structs ---
 typedef struct CanvasChunk {
@@ -102,14 +102,14 @@ int main(void) {
         .font = LoadFontEx("LiberationSans-Regular.ttf", BASE_FONT_SIZE, 0, 0),
         .selectedHSV = { 0.0f, 0.0f, 0.0f } // Start with black
     };
-    
-    Image colorPickerImage = GenImageColorPicker(400, 400, ui.selectedHSV.x);
+
+    Image colorPickerImage = GenImageColorPicker(450, 450, ui.selectedHSV.x);
     ui.colorPickerTexture = LoadTextureFromImage(colorPickerImage);
     UnloadImage(colorPickerImage);
 
     while (!WindowShouldClose()) {
         camera.offset = (Vector2){ GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f };
-        ui.colorPickerRect = (Rectangle){ 10, (float)GetScreenHeight() - 410, 400, 400 };
+        ui.colorPickerRect = (Rectangle){ 0, (float)GetScreenHeight() - 450, 450, 450 };
 
         Canvas_Update(&canvas, camera, GetScreenWidth(), GetScreenHeight());
 
@@ -237,9 +237,9 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
             UnloadImage(newImage);
         } else {
             if (*currentTool == TOOL_BRUSH) {
-                *brushSize *= (1.0f + wheel * 0.1f);
+                *brushSize *= (1.0f + wheel * 0.2f); // MODIFIED: Increased scroll speed
                 if (*brushSize < 2) *brushSize = 2;
-                if (*brushSize > 500) *brushSize = 500;
+                if (*brushSize > 2000) *brushSize = 2000; // MODIFIED: Increased max brush size
             } else if (*currentTool == TOOL_TEXT) {
                 *textSize *= (1.0f + wheel * 0.1f);
                 if (*textSize < 8) *textSize = 8;
@@ -248,28 +248,49 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
         }
     }
 
+    // MODIFIED: Replaced circle-stamping with capsule drawing for smooth lines
     if (*currentTool == TOOL_BRUSH && !isInteractingWithUI) {
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             static Vector2 lastMousePos = { 0 };
-            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) lastMousePos = mouseWorldPos;
-            float dist = Vector2Distance(lastMousePos, mouseWorldPos);
-            int steps = 1 + (int)(dist / (*brushSize / 4.0f));
-            for (int i = 0; i <= steps; i++) {
-                Vector2 drawPos = Vector2Lerp(lastMousePos, mouseWorldPos, (float)i/steps);
-                float radius = *brushSize / 2.0f;
-                Vector2 minGrid = WorldToGrid((Vector2){ drawPos.x - radius, drawPos.y - radius });
-                Vector2 maxGrid = WorldToGrid((Vector2){ drawPos.x + radius, drawPos.y + radius });
-                for (int y = (int)minGrid.y; y <= (int)maxGrid.y; y++) {
-                    for (int x = (int)minGrid.x; x <= (int)maxGrid.x; x++) {
-                        if (Canvas_BeginTextureMode(canvas, (Vector2){x * CHUNK_SIZE, y * CHUNK_SIZE})) {
-                            Vector2 localPos = GetLocalChunkPos(drawPos, (Vector2){(float)x, (float)y});
-                            DrawCircleV(localPos, radius, *currentColor);
-                            Canvas_EndTextureMode();
-                        }
+            // On the very first frame of a click, set last pos to current pos to draw a single dot.
+            if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+                lastMousePos = mouseWorldPos;
+            }
+
+            float radius = *brushSize / 2.0f;
+            
+            // Calculate the bounding box for the entire line segment (capsule)
+            Vector2 minWorld = {
+                fminf(lastMousePos.x, mouseWorldPos.x) - radius,
+                fminf(lastMousePos.y, mouseWorldPos.y) - radius
+            };
+            Vector2 maxWorld = {
+                fmaxf(lastMousePos.x, mouseWorldPos.x) + radius,
+                fmaxf(lastMousePos.y, mouseWorldPos.y) + radius
+            };
+            Vector2 minGrid = WorldToGrid(minWorld);
+            Vector2 maxGrid = WorldToGrid(maxWorld);
+
+            // Iterate over all chunks the capsule might touch
+            for (int y = (int)minGrid.y; y <= (int)maxGrid.y; y++) {
+                for (int x = (int)minGrid.x; x <= (int)maxGrid.x; x++) {
+                    Vector2 currentGridPos = {(float)x, (float)y};
+                    if (Canvas_BeginTextureMode(canvas, (Vector2){x * CHUNK_SIZE, y * CHUNK_SIZE})) {
+                        // Get positions relative to the current chunk
+                        Vector2 localLast = GetLocalChunkPos(lastMousePos, currentGridPos);
+                        Vector2 localCurrent = GetLocalChunkPos(mouseWorldPos, currentGridPos);
+                        
+                        // Draw the capsule components
+                        DrawLineEx(localLast, localCurrent, *brushSize, *currentColor);
+                        DrawCircleV(localLast, radius, *currentColor);
+                        DrawCircleV(localCurrent, radius, *currentColor);
+                        
+                        Canvas_EndTextureMode();
                     }
                 }
             }
-            lastMousePos = mouseWorldPos;
+            
+            lastMousePos = mouseWorldPos; // Update for the next frame
         }
     } else if (*currentTool == TOOL_TEXT) {
         if (textInput->active) {
@@ -384,10 +405,10 @@ CanvasChunk* GetAndActivateChunk(Canvas *canvas, Vector2 gridPos) {
                     BeginTextureMode(newChunk->texture);
                         DrawTexture(tex, 0, 0, WHITE);
                     EndTextureMode();
-                    UnloadTexture(tex); 
+                    UnloadTexture(tex);
                     UnloadImage(canvas->cache[j].image);
                     canvas->cache[j].active = false;
-                    newChunk->modified = true; 
+                    newChunk->modified = true;
                     return newChunk;
                 }
             }
@@ -399,7 +420,7 @@ CanvasChunk* GetAndActivateChunk(Canvas *canvas, Vector2 gridPos) {
             return newChunk;
         }
     }
-    return NULL; 
+    return NULL;
 }
 
 void Canvas_Update(Canvas *canvas, Camera2D camera, int screenWidth, int screenHeight) {
