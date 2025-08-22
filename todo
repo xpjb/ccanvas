@@ -1,0 +1,17 @@
+smoother rendering, sd seg analytic formula. Would be nice but beyond gpt, it was using a shader, lol
+
+
+ctrl z etc
+
+saving etc
+quality hover over palette etc
+layers 1-9
+text right click off needs to keep the text
+every kind of state exit there needs to keep the text
+   whats the right way to do a state machine with formal transitions in C lol - transitions=functions?
+left click off needs to not draw a line segment
+
+shift sample to blend
+eg buffer all and then move thing to in the middle of
+
+

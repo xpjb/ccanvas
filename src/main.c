@@ -13,7 +13,8 @@
 #define MAX_CACHED_CHUNKS 512
 #define TEXT_INPUT_MAX 255
 #define BASE_FONT_SIZE 256
-#define COLOR_PICKER_GAMMA 1.5f // Use a less aggressive power curve
+#define COLOR_PICKER_GAMMA 1.5f
+#define MAX_UNDO_ACTIONS 100
 
 //--- Structs ---
 typedef struct CanvasChunk {
@@ -29,11 +30,35 @@ typedef struct CachedChunk {
     bool active;
 } CachedChunk;
 
+// --- Undo/Redo Structs ---
+// Represents the state of a single chunk before a modification
+typedef struct UndoChunkState {
+    Image beforeImage;
+    Vector2 gridPos;
+} UndoChunkState;
+
+// Represents a single atomic action (like a brush stroke or text stamp)
+typedef struct UndoAction {
+    UndoChunkState *chunkStates;
+    int numChunks;
+} UndoAction;
+
+// Manages the entire undo/redo history
+typedef struct UndoState {
+    UndoAction undoStack[MAX_UNDO_ACTIONS];
+    UndoAction redoStack[MAX_UNDO_ACTIONS];
+    int undoCount;
+    int redoCount;
+    UndoAction *currentAction; // Action currently being recorded
+} UndoState;
+
+
 typedef struct Canvas {
     CanvasChunk *chunks;
     int totalChunks;
     CachedChunk *cache;
     int cacheSize;
+    UndoState undoState; // Add undo state to the canvas
 } Canvas;
 
 typedef enum {
@@ -65,6 +90,15 @@ void Canvas_Destroy(Canvas canvas);
 Vector2 WorldToGrid(Vector2 worldPos);
 CanvasChunk* GetAndActivateChunk(Canvas *canvas, Vector2 gridPos);
 
+//--- Undo/Redo Module ---
+void Undo_BeginAction(UndoState *undoState);
+void Undo_AddChunkToCurrentAction(Canvas *canvas, UndoState *undoState, Vector2 gridPos);
+void Undo_EndAction(UndoState *undoState);
+void Undo_PerformUndo(Canvas *canvas, UndoState *undoState);
+void Undo_PerformRedo(Canvas *canvas, UndoState *undoState);
+void Undo_Destroy(UndoState *undoState);
+
+
 //--- Helper Functions ---
 void HandleCameraControls(Camera2D *camera);
 void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool, float *brushSize, float *textSize, Color *currentColor, TextInput *textInput, UIState *ui);
@@ -79,7 +113,7 @@ int main(void) {
     const int screenHeight = 1080;
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-    InitWindow(screenWidth, screenHeight, "ccanvas - with caching");
+    InitWindow(screenWidth, screenHeight, "ccanvas - with undo");
     SetExitKey(KEY_NULL);
     SetTargetFPS(60);
 
@@ -115,6 +149,17 @@ int main(void) {
 
         HandleCameraControls(&camera);
         HandleToolAndDrawing(&canvas, camera, &currentTool, &brushSize, &textSize, &currentColor, &textInput, &ui);
+
+        // Handle Undo/Redo with immediate press and key repeat
+        if (IsKeyDown(KEY_LEFT_CONTROL)) {
+            if (IsKeyPressed(KEY_Z) || IsKeyPressedRepeat(KEY_Z)) {
+                Undo_PerformUndo(&canvas, &canvas.undoState);
+            }
+            if (IsKeyPressed(KEY_Y) || IsKeyPressedRepeat(KEY_Y)) {
+                Undo_PerformRedo(&canvas, &canvas.undoState);
+            }
+        }
+
 
         BeginDrawing();
             ClearBackground(DARKGRAY);
@@ -169,6 +214,15 @@ void StampText(Canvas *canvas, Font font, TextInput *input, Color color, float t
     Vector2 measuredSize = MeasureTextEx(font, input->text, textSize, (float)textSize/BASE_FONT_SIZE);
     Vector2 minGrid = WorldToGrid(textWorldPos);
     Vector2 maxGrid = WorldToGrid(Vector2Add(textWorldPos, measuredSize));
+
+    Undo_BeginAction(&canvas->undoState);
+    for (int y = (int)minGrid.y; y <= (int)maxGrid.y; y++) {
+        for (int x = (int)minGrid.x; x <= (int)maxGrid.x; x++) {
+            Undo_AddChunkToCurrentAction(canvas, &canvas->undoState, (Vector2){(float)x, (float)y});
+        }
+    }
+    Undo_EndAction(&canvas->undoState);
+
 
     for (int y = (int)minGrid.y; y <= (int)maxGrid.y; y++) {
         for (int x = (int)minGrid.x; x <= (int)maxGrid.x; x++) {
@@ -237,9 +291,9 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
             UnloadImage(newImage);
         } else {
             if (*currentTool == TOOL_BRUSH) {
-                *brushSize *= (1.0f + wheel * 0.2f); // MODIFIED: Increased scroll speed
+                *brushSize *= (1.0f + wheel * 0.2f);
                 if (*brushSize < 2) *brushSize = 2;
-                if (*brushSize > 2000) *brushSize = 2000; // MODIFIED: Increased max brush size
+                if (*brushSize > 2000) *brushSize = 2000;
             } else if (*currentTool == TOOL_TEXT) {
                 *textSize *= (1.0f + wheel * 0.1f);
                 if (*textSize < 8) *textSize = 8;
@@ -248,18 +302,19 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
         }
     }
 
-    // MODIFIED: Replaced circle-stamping with capsule drawing for smooth lines
     if (*currentTool == TOOL_BRUSH && !isInteractingWithUI) {
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+             Undo_BeginAction(&canvas->undoState);
+        }
+
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
             static Vector2 lastMousePos = { 0 };
-            // On the very first frame of a click, set last pos to current pos to draw a single dot.
             if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
                 lastMousePos = mouseWorldPos;
             }
 
             float radius = *brushSize / 2.0f;
             
-            // Calculate the bounding box for the entire line segment (capsule)
             Vector2 minWorld = {
                 fminf(lastMousePos.x, mouseWorldPos.x) - radius,
                 fminf(lastMousePos.y, mouseWorldPos.y) - radius
@@ -271,16 +326,14 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
             Vector2 minGrid = WorldToGrid(minWorld);
             Vector2 maxGrid = WorldToGrid(maxWorld);
 
-            // Iterate over all chunks the capsule might touch
             for (int y = (int)minGrid.y; y <= (int)maxGrid.y; y++) {
                 for (int x = (int)minGrid.x; x <= (int)maxGrid.x; x++) {
                     Vector2 currentGridPos = {(float)x, (float)y};
+                    Undo_AddChunkToCurrentAction(canvas, &canvas->undoState, currentGridPos);
                     if (Canvas_BeginTextureMode(canvas, (Vector2){x * CHUNK_SIZE, y * CHUNK_SIZE})) {
-                        // Get positions relative to the current chunk
                         Vector2 localLast = GetLocalChunkPos(lastMousePos, currentGridPos);
                         Vector2 localCurrent = GetLocalChunkPos(mouseWorldPos, currentGridPos);
                         
-                        // Draw the capsule components
                         DrawLineEx(localLast, localCurrent, *brushSize, *currentColor);
                         DrawCircleV(localLast, radius, *currentColor);
                         DrawCircleV(localCurrent, radius, *currentColor);
@@ -290,7 +343,10 @@ void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool
                 }
             }
             
-            lastMousePos = mouseWorldPos; // Update for the next frame
+            lastMousePos = mouseWorldPos;
+        }
+        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            Undo_EndAction(&canvas->undoState);
         }
     } else if (*currentTool == TOOL_TEXT) {
         if (textInput->active) {
@@ -348,7 +404,6 @@ void DrawWorld(Canvas canvas, Camera2D camera, ToolType currentTool, float brush
 }
 
 void DrawUI(ToolType currentTool, Color currentColor, UIState *ui) {
-    // Draw Saturation/Value Picker
     DrawTexture(ui->colorPickerTexture, ui->colorPickerRect.x, ui->colorPickerRect.y, WHITE);
     DrawRectangleLinesEx(ui->colorPickerRect, 1.0f, LIGHTGRAY);
     float linearValue = powf(ui->selectedHSV.z, 1.0f / COLOR_PICKER_GAMMA);
@@ -362,6 +417,7 @@ void DrawUI(ToolType currentTool, Color currentColor, UIState *ui) {
     const char *toolName = (currentTool == TOOL_BRUSH) ? "BRUSH (B)" : "TEXT (T)";
     DrawTextEx(ui->font, TextFormat("Tool: %s", toolName), (Vector2){10, 10}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
     DrawTextEx(ui->font, "pan: RMB | zoom: Ctrl+scroll | size/hue: scroll", (Vector2){10, 40}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
+    DrawTextEx(ui->font, "undo: Ctrl+Z | redo: Ctrl+Y", (Vector2){10, 70}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
 }
 
 Vector2 GetLocalChunkPos(Vector2 worldPos, Vector2 gridPos) {
@@ -383,6 +439,12 @@ Canvas Canvas_Create(void) {
     canvas.cacheSize = MAX_CACHED_CHUNKS;
     canvas.cache = (CachedChunk*)malloc(sizeof(CachedChunk) * canvas.cacheSize);
     for (int i = 0; i < canvas.cacheSize; i++) canvas.cache[i].active = false;
+    
+    // Initialize UndoState
+    canvas.undoState.undoCount = 0;
+    canvas.undoState.redoCount = 0;
+    canvas.undoState.currentAction = NULL;
+
     printf("Canvas created with GPU pool for %d chunks and CPU cache for %d chunks.\n", canvas.totalChunks, canvas.cacheSize);
     return canvas;
 }
@@ -504,4 +566,189 @@ void Canvas_Destroy(Canvas canvas) {
         if (canvas.cache[i].active) UnloadImage(canvas.cache[i].image);
     }
     free(canvas.cache);
+    Undo_Destroy(&canvas.undoState);
 }
+
+//--- Undo/Redo Implementations ---
+
+void Undo_BeginAction(UndoState *undoState) {
+    if (undoState->currentAction != NULL) {
+        // This case should ideally not happen if EndAction is always called.
+        // But as a safeguard, we can end the previous action.
+        Undo_EndAction(undoState);
+    }
+    undoState->currentAction = (UndoAction*)calloc(1, sizeof(UndoAction));
+}
+
+void Undo_AddChunkToCurrentAction(Canvas *canvas, UndoState *undoState, Vector2 gridPos) {
+    if (undoState->currentAction == NULL) return;
+
+    // Check if we've already stored the "before" state for this chunk in this action
+    for (int i = 0; i < undoState->currentAction->numChunks; i++) {
+        if (Vector2Equals(undoState->currentAction->chunkStates[i].gridPos, gridPos)) {
+            return; // Already saved
+        }
+    }
+
+    CanvasChunk* chunk = GetAndActivateChunk(canvas, gridPos);
+    if (chunk) {
+        undoState->currentAction->numChunks++;
+        undoState->currentAction->chunkStates = (UndoChunkState*)realloc(undoState->currentAction->chunkStates, undoState->currentAction->numChunks * sizeof(UndoChunkState));
+        
+        Image img = LoadImageFromTexture(chunk->texture.texture);
+        ImageFlipVertical(&img); // Important for correct re-drawing
+        
+        undoState->currentAction->chunkStates[undoState->currentAction->numChunks - 1] = (UndoChunkState){
+            .beforeImage = img,
+            .gridPos = gridPos
+        };
+    }
+}
+
+void Undo_EndAction(UndoState *undoState) {
+    if (undoState->currentAction == NULL || undoState->currentAction->numChunks == 0) {
+        if (undoState->currentAction) {
+            free(undoState->currentAction);
+            undoState->currentAction = NULL;
+        }
+        return;
+    }
+
+    if (undoState->undoCount >= MAX_UNDO_ACTIONS) {
+        // Free the oldest action to make space
+        UndoAction *oldestAction = &undoState->undoStack[0];
+        for (int j = 0; j < oldestAction->numChunks; j++) {
+            UnloadImage(oldestAction->chunkStates[j].beforeImage);
+        }
+        free(oldestAction->chunkStates);
+
+        // Shift everything down
+        for (int i = 0; i < MAX_UNDO_ACTIONS - 1; i++) {
+            undoState->undoStack[i] = undoState->undoStack[i+1];
+        }
+        undoState->undoCount--;
+    }
+
+    undoState->undoStack[undoState->undoCount++] = *undoState->currentAction;
+    
+    free(undoState->currentAction);
+    undoState->currentAction = NULL;
+
+    // Clear the redo stack
+    for(int i = 0; i < undoState->redoCount; i++) {
+        for(int j = 0; j < undoState->redoStack[i].numChunks; j++) {
+            UnloadImage(undoState->redoStack[i].chunkStates[j].beforeImage);
+        }
+        free(undoState->redoStack[i].chunkStates);
+    }
+    undoState->redoCount = 0;
+}
+
+void ApplyUndoAction(Canvas *canvas, UndoAction *action) {
+    for (int i = 0; i < action->numChunks; i++) {
+        UndoChunkState *state = &action->chunkStates[i];
+        CanvasChunk* chunk = GetAndActivateChunk(canvas, state->gridPos);
+        if (chunk) {
+            // The image in the undo state becomes the *new* texture
+            Texture2D tex = LoadTextureFromImage(state->beforeImage);
+            BeginTextureMode(chunk->texture);
+                ClearBackground(RAYWHITE); // Clear to avoid artifacts
+                DrawTexture(tex, 0, 0, WHITE);
+            EndTextureMode();
+            UnloadTexture(tex);
+            chunk->modified = true;
+        }
+    }
+}
+
+
+void Undo_PerformUndo(Canvas *canvas, UndoState *undoState) {
+    if (undoState->undoCount == 0) return;
+
+    // 1. Pop the action from the undo stack
+    undoState->undoCount--;
+    UndoAction actionToUndo = undoState->undoStack[undoState->undoCount];
+
+    // 2. Create a "redo" action to store the *current* state before we undo
+    UndoAction redoAction = {0};
+    redoAction.numChunks = actionToUndo.numChunks;
+    redoAction.chunkStates = (UndoChunkState*)malloc(redoAction.numChunks * sizeof(UndoChunkState));
+
+    for (int i = 0; i < actionToUndo.numChunks; i++) {
+        Vector2 gridPos = actionToUndo.chunkStates[i].gridPos;
+        CanvasChunk *chunk = GetAndActivateChunk(canvas, gridPos);
+        Image currentImage = LoadImageFromTexture(chunk->texture.texture);
+        ImageFlipVertical(&currentImage);
+        redoAction.chunkStates[i] = (UndoChunkState){ .beforeImage = currentImage, .gridPos = gridPos };
+    }
+
+    // 3. Apply the "before" images from the undo action back to the canvas
+    ApplyUndoAction(canvas, &actionToUndo);
+
+    // 4. Push the new redo action onto the redo stack
+    if (undoState->redoCount < MAX_UNDO_ACTIONS) {
+        undoState->redoStack[undoState->redoCount++] = redoAction;
+    } else {
+        // Redo stack is full, discard this redo action
+        for(int i = 0; i < redoAction.numChunks; i++) UnloadImage(redoAction.chunkStates[i].beforeImage);
+        free(redoAction.chunkStates);
+    }
+
+    // 5. Free the original undo action's images
+    for(int i = 0; i < actionToUndo.numChunks; i++) UnloadImage(actionToUndo.chunkStates[i].beforeImage);
+    free(actionToUndo.chunkStates);
+}
+
+void Undo_PerformRedo(Canvas *canvas, UndoState *undoState) {
+    if (undoState->redoCount == 0) return;
+
+    // 1. Pop the action from the redo stack
+    undoState->redoCount--;
+    UndoAction actionToRedo = undoState->redoStack[undoState->redoCount];
+
+    // 2. Create an "undo" action to store the *current* state before we redo
+    UndoAction undoAction = {0};
+    undoAction.numChunks = actionToRedo.numChunks;
+    undoAction.chunkStates = (UndoChunkState*)malloc(undoAction.numChunks * sizeof(UndoChunkState));
+
+    for (int i = 0; i < actionToRedo.numChunks; i++) {
+        Vector2 gridPos = actionToRedo.chunkStates[i].gridPos;
+        CanvasChunk *chunk = GetAndActivateChunk(canvas, gridPos);
+        Image currentImage = LoadImageFromTexture(chunk->texture.texture);
+        ImageFlipVertical(&currentImage);
+        undoAction.chunkStates[i] = (UndoChunkState){ .beforeImage = currentImage, .gridPos = gridPos };
+    }
+
+    // 3. Apply the "before" images from the redo action back to the canvas
+    ApplyUndoAction(canvas, &actionToRedo);
+
+    // 4. Push the new undo action onto the undo stack
+    if (undoState->undoCount < MAX_UNDO_ACTIONS) {
+        undoState->undoStack[undoState->undoCount++] = undoAction;
+    } else {
+        // Undo stack is full, discard
+        for(int i = 0; i < undoAction.numChunks; i++) UnloadImage(undoAction.chunkStates[i].beforeImage);
+        free(undoAction.chunkStates);
+    }
+    
+    // 5. Free the original redo action's images
+    for(int i = 0; i < actionToRedo.numChunks; i++) UnloadImage(actionToRedo.chunkStates[i].beforeImage);
+    free(actionToRedo.chunkStates);
+}
+
+
+void Undo_Destroy(UndoState *undoState) {
+    for (int i = 0; i < undoState->undoCount; i++) {
+        for(int j = 0; j < undoState->undoStack[i].numChunks; j++) {
+            UnloadImage(undoState->undoStack[i].chunkStates[j].beforeImage);
+        }
+        free(undoState->undoStack[i].chunkStates);
+    }
+    for (int i = 0; i < undoState->redoCount; i++) {
+        for(int j = 0; j < undoState->redoStack[i].numChunks; j++) {
+            UnloadImage(undoState->redoStack[i].chunkStates[j].beforeImage);
+        }
+        free(undoState->redoStack[i].chunkStates);
+    }
+}
+
