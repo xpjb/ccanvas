@@ -15,6 +15,8 @@
 #define BASE_FONT_SIZE 256
 #define COLOR_PICKER_GAMMA 1.5f
 #define MAX_UNDO_ACTIONS 100
+#define SAVE_FILE_MAGIC 0x43414E56 // "CANV"
+#define SAVE_FILE_VERSION 1
 
 //--- Structs ---
 typedef struct CanvasChunk {
@@ -89,6 +91,9 @@ void Canvas_Draw(Canvas canvas);
 void Canvas_Destroy(Canvas canvas);
 Vector2 WorldToGrid(Vector2 worldPos);
 CanvasChunk* GetAndActivateChunk(Canvas *canvas, Vector2 gridPos);
+void Canvas_Save(Canvas *canvas, const char* path);
+void Canvas_Load(Canvas *canvas, const char* path);
+
 
 //--- Undo/Redo Module ---
 void Undo_BeginAction(UndoState *undoState);
@@ -103,7 +108,7 @@ void Undo_Destroy(UndoState *undoState);
 void HandleCameraControls(Camera2D *camera);
 void HandleToolAndDrawing(Canvas *canvas, Camera2D camera, ToolType *currentTool, float *brushSize, float *textSize, Color *currentColor, TextInput *textInput, UIState *ui);
 void DrawWorld(Canvas canvas, Camera2D camera, ToolType currentTool, float brushSize, float textSize, TextInput textInput, UIState ui, Color currentColor);
-void DrawUI(ToolType currentTool, Color currentColor, UIState *ui);
+void DrawUI(ToolType currentTool, UIState *ui);
 Vector2 GetLocalChunkPos(Vector2 worldPos, Vector2 gridPos);
 Image GenImageColorPicker(int width, int height, float hue);
 
@@ -113,7 +118,7 @@ int main(void) {
     const int screenHeight = 1080;
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-    InitWindow(screenWidth, screenHeight, "ccanvas - with undo");
+    InitWindow(screenWidth, screenHeight, "canvas.dat"); // Set default filename in title
     SetExitKey(KEY_NULL);
     SetTargetFPS(60);
 
@@ -141,6 +146,8 @@ int main(void) {
     ui.colorPickerTexture = LoadTextureFromImage(colorPickerImage);
     UnloadImage(colorPickerImage);
 
+    char filePath[256] = "canvas.dat"; // Default save path
+
     while (!WindowShouldClose()) {
         camera.offset = (Vector2){ GetScreenWidth() / 2.0f, GetScreenHeight() / 2.0f };
         ui.colorPickerRect = (Rectangle){ 0, (float)GetScreenHeight() - 450, 450, 450 };
@@ -149,6 +156,17 @@ int main(void) {
 
         HandleCameraControls(&camera);
         HandleToolAndDrawing(&canvas, camera, &currentTool, &brushSize, &textSize, &currentColor, &textInput, &ui);
+
+        // Handle Save/Load
+        if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_S)) {
+            // NOTE: raylib does not have a GetWindowTitle function.
+            // We'll use a fixed file path for now. A more advanced solution
+            // would involve implementing a text input box for the filename.
+            Canvas_Save(&canvas, filePath);
+        }
+        if (IsKeyDown(KEY_LEFT_CONTROL) && IsKeyPressed(KEY_L)) {
+            Canvas_Load(&canvas, filePath);
+        }
 
         // Handle Undo/Redo with immediate press and key repeat
         if (IsKeyDown(KEY_LEFT_CONTROL)) {
@@ -164,7 +182,7 @@ int main(void) {
         BeginDrawing();
             ClearBackground(DARKGRAY);
             DrawWorld(canvas, camera, currentTool, brushSize, textSize, textInput, ui, currentColor);
-            DrawUI(currentTool, currentColor, &ui);
+            DrawUI(currentTool, &ui);
         EndDrawing();
     }
 
@@ -403,7 +421,7 @@ void DrawWorld(Canvas canvas, Camera2D camera, ToolType currentTool, float brush
     EndMode2D();
 }
 
-void DrawUI(ToolType currentTool, Color currentColor, UIState *ui) {
+void DrawUI(ToolType currentTool, UIState *ui) {
     DrawTexture(ui->colorPickerTexture, ui->colorPickerRect.x, ui->colorPickerRect.y, WHITE);
     DrawRectangleLinesEx(ui->colorPickerRect, 1.0f, LIGHTGRAY);
     float linearValue = powf(ui->selectedHSV.z, 1.0f / COLOR_PICKER_GAMMA);
@@ -417,7 +435,7 @@ void DrawUI(ToolType currentTool, Color currentColor, UIState *ui) {
     const char *toolName = (currentTool == TOOL_BRUSH) ? "BRUSH (B)" : "TEXT (T)";
     DrawTextEx(ui->font, TextFormat("Tool: %s", toolName), (Vector2){10, 10}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
     DrawTextEx(ui->font, "pan: RMB | zoom: Ctrl+scroll | size/hue: scroll", (Vector2){10, 40}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
-    DrawTextEx(ui->font, "undo: Ctrl+Z | redo: Ctrl+Y", (Vector2){10, 70}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
+    DrawTextEx(ui->font, "undo: Ctrl+Z | redo: Ctrl+Y | save: Ctrl+S | load: Ctrl+L", (Vector2){10, 70}, 20.0f, 20.0f/BASE_FONT_SIZE, LIGHTGRAY);
 }
 
 Vector2 GetLocalChunkPos(Vector2 worldPos, Vector2 gridPos) {
@@ -568,6 +586,103 @@ void Canvas_Destroy(Canvas canvas) {
     free(canvas.cache);
     Undo_Destroy(&canvas.undoState);
 }
+
+void Canvas_Save(Canvas *canvas, const char* path) {
+    FILE *file = fopen(path, "wb");
+    if (!file) {
+        printf("ERROR: Could not open file '%s' for writing.\n", path);
+        return;
+    }
+
+    // Write header
+    unsigned int magic = SAVE_FILE_MAGIC;
+    unsigned int version = SAVE_FILE_VERSION;
+    fwrite(&magic, sizeof(unsigned int), 1, file);
+    fwrite(&version, sizeof(unsigned int), 1, file);
+
+    // Save active chunks
+    for (int i = 0; i < canvas->totalChunks; i++) {
+        if (canvas->chunks[i].active && canvas->chunks[i].modified) {
+            Image img = LoadImageFromTexture(canvas->chunks[i].texture.texture);
+            ImageFlipVertical(&img);
+            fwrite(&canvas->chunks[i].gridPos, sizeof(Vector2), 1, file);
+            fwrite(img.data, sizeof(Color), CHUNK_SIZE * CHUNK_SIZE, file);
+            UnloadImage(img);
+        }
+    }
+    // Save cached chunks
+    for (int i = 0; i < canvas->cacheSize; i++) {
+        if (canvas->cache[i].active) {
+            fwrite(&canvas->cache[i].gridPos, sizeof(Vector2), 1, file);
+            fwrite(canvas->cache[i].image.data, sizeof(Color), CHUNK_SIZE * CHUNK_SIZE, file);
+        }
+    }
+
+    fclose(file);
+    printf("Canvas saved to '%s'\n", path);
+}
+
+void Canvas_Load(Canvas *canvas, const char* path) {
+    FILE *file = fopen(path, "rb");
+    if (!file) {
+        printf("ERROR: Could not open file '%s' for reading.\n", path);
+        return;
+    }
+
+    // Read and verify header
+    unsigned int magic;
+    unsigned int version;
+    fread(&magic, sizeof(unsigned int), 1, file);
+    fread(&version, sizeof(unsigned int), 1, file);
+
+    if (magic != SAVE_FILE_MAGIC || version != SAVE_FILE_VERSION) {
+        printf("ERROR: Invalid save file format or version.\n");
+        fclose(file);
+        return;
+    }
+
+    // Clear existing canvas state
+    for (int i = 0; i < canvas->totalChunks; i++) {
+        if (canvas->chunks[i].active) {
+            UnloadRenderTexture(canvas->chunks[i].texture);
+            canvas->chunks[i].active = false;
+        }
+    }
+    for (int i = 0; i < canvas->cacheSize; i++) {
+        if (canvas->cache[i].active) {
+            UnloadImage(canvas->cache[i].image);
+            canvas->cache[i].active = false;
+        }
+    }
+    Undo_Destroy(&canvas->undoState);
+    canvas->undoState = (UndoState){0};
+
+
+    // Load chunks into cache
+    int cacheIndex = 0;
+    while (!feof(file) && cacheIndex < canvas->cacheSize) {
+        Vector2 gridPos;
+        if (fread(&gridPos, sizeof(Vector2), 1, file) != 1) break;
+
+        Image img = {
+            .data = malloc(CHUNK_SIZE * CHUNK_SIZE * sizeof(Color)),
+            .width = CHUNK_SIZE,
+            .height = CHUNK_SIZE,
+            .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8,
+            .mipmaps = 1
+        };
+        fread(img.data, sizeof(Color), CHUNK_SIZE * CHUNK_SIZE, file);
+        
+        canvas->cache[cacheIndex].image = img;
+        canvas->cache[cacheIndex].gridPos = gridPos;
+        canvas->cache[cacheIndex].active = true;
+        cacheIndex++;
+    }
+
+    fclose(file);
+    printf("Canvas loaded from '%s'\n", path);
+}
+
 
 //--- Undo/Redo Implementations ---
 
